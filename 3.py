@@ -15,7 +15,43 @@ from llama_index.graph_stores.neo4j import Neo4jPropertyGraphStore
 from llama_index.llms.ollama import Ollama
 from llama_index.embeddings.ollama import OllamaEmbedding
 
+from ragas import evaluate
+from ragas.metrics import faithfulness, answer_relevancy, context_precision, context_recall
+from ragas.llms import LangchainLLMWrapper
+from ragas.embeddings import LangchainEmbeddingsWrapper
+from langchain_ollama import ChatOllama, OllamaEmbeddings
+from datasets import Dataset
+
 app = FastAPI(title="RAG Grafo - Legal Peruano", version="3.0")
+
+
+EVAL_DATASET = [
+    {
+        "question": "¿Qué es la Constitución Política?",
+        "ground_truth": "Es la norma suprema de un Estado que establece la organización del poder y los derechos fundamentales.",
+    },
+    {
+        "question": "¿Cuál es la función principal de la Constitución?",
+        "ground_truth": "Organizar el poder del Estado y garantizar los derechos fundamentales de las personas.",
+    },
+    {
+        "question": "¿Qué regula la Constitución del Perú de 1993?",
+        "ground_truth": "Regula el sistema político y la organización del Estado peruano.",
+    },
+    {
+        "question": "¿Qué es el Derecho Civil?",
+        "ground_truth": "Es la rama del derecho que regula las relaciones entre personas en el ámbito privado.",
+    },
+    {
+        "question": "¿Qué es el Derecho Penal?",
+        "ground_truth": "Es la rama del derecho que regula los delitos y establece sanciones.",
+    },
+    {
+        "question": "¿Cuál es la función del Derecho Penal?",
+        "ground_truth": "Proteger bienes jurídicos y sancionar conductas ilícitas.",
+    },
+
+]
 
 # ---------------------------------------------------------------------------
 # CONFIGURACIÓN GLOBAL
@@ -26,7 +62,7 @@ OLLAMA_BASE_URL  = "http://localhost:11434"
 MINIO_ENDPOINT   = "http://localhost:9000"
 MINIO_ACCESS_KEY = "admin"
 MINIO_SECRET_KEY = "password123"
-BUCKET_NAME      = "salpma1"
+BUCKET_NAME      = "eval"
 
 # Configuración Neo4j
 NEO4J_URL        = "bolt://localhost:7687"
@@ -221,6 +257,124 @@ async def preguntar(data: PreguntaDTO):
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+# ---------------------------------------------------------------------------
+# ENDPOINT /evaluar
+# ---------------------------------------------------------------------------
+@app.post("/evaluar")
+async def evaluar():
+    """
+    Corre evaluación RAGAS sobre el dataset embebido.
+    Requiere que /cargar o /cargartexto ya hayan sido ejecutados.
+
+    NOTA: El query_engine se crea igual que en /preguntar para que
+    RAGAS evalúe exactamente el mismo pipeline de producción.
+    """
+    global graph_index
+
+    if graph_index is None:
+        raise HTTPException(
+            status_code=400,
+            detail="El índice no está listo. Ejecuta /cargar o /cargartexto primero."
+        )
+
+    # Reutilizamos el mismo query_engine que /preguntar
+    query_engine = graph_index.as_query_engine(
+        include_text=True,
+        similarity_top_k=5
+    )
+
+    questions, answers, contexts, ground_truths = [], [], [], []
+
+    for item in EVAL_DATASET:
+        try:
+            # El grafo usa query síncrono internamente, pero estamos en async —
+            # lo corremos en el executor para no bloquear el event loop
+            loop = asyncio.get_running_loop()
+            result = await loop.run_in_executor(
+                executor,
+                query_engine.query,
+                item["question"]
+            )
+
+            # En PropertyGraphIndex los source_nodes pueden venir de nodos
+            # del grafo o de chunks de texto, dependiendo del retriever
+            source_nodes = result.source_nodes if hasattr(result, "source_nodes") else []
+
+            if source_nodes:
+                ctx = [node.get_content() for node in source_nodes]
+            else:
+                # Fallback: usamos la respuesta misma como contexto mínimo
+                # para no romper RAGAS (evita listas vacías)
+                ctx = [str(result)]
+
+            questions.append(item["question"])
+            answers.append(str(result))
+            contexts.append(ctx)
+            ground_truths.append(item["ground_truth"])
+
+        except Exception as e:
+            print(f"⚠️ Error en pregunta '{item['question']}': {e}")
+            questions.append(item["question"])
+            answers.append("")
+            contexts.append([""])
+            ground_truths.append(item["ground_truth"])
+
+    # Dataset HuggingFace
+    hf_dataset = Dataset.from_dict({
+        "question":     questions,
+        "answer":       answers,
+        "contexts":     contexts,
+        "ground_truth": ground_truths,
+    })
+
+    # ── Configuración RAGAS con Ollama ────────────────────────────────────────
+    ragas_llm = LangchainLLMWrapper(
+        ChatOllama(model=DEFAULT_LLM_MODEL, base_url=OLLAMA_BASE_URL, temperature=0.0)
+    )
+    ragas_embeddings = LangchainEmbeddingsWrapper(
+        OllamaEmbeddings(model=DEFAULT_EMBED_MODEL, base_url=OLLAMA_BASE_URL)
+    )
+
+    metrics = [faithfulness, answer_relevancy, context_precision, context_recall]
+    for m in metrics:
+        m.llm = ragas_llm
+        if hasattr(m, "embeddings"):
+            m.embeddings = ragas_embeddings
+
+    # RAGAS evaluate es síncrono — lo corremos en executor para no bloquear
+    try:
+        loop = asyncio.get_running_loop()
+        result_ragas = await loop.run_in_executor(
+            executor,
+            lambda: evaluate(hf_dataset, metrics=metrics)
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error en evaluación RAGAS: {e}")
+
+    scores_df = result_ragas.to_pandas()
+
+    # Nombres de columnas cambian según la versión de RAGAS:
+    # ≤ 0.1.x → "question", "answer"
+    # ≥ 0.2.x → "user_input", "response"
+    col_question = "user_input"  if "user_input"  in scores_df.columns else "question"
+    col_answer   = "response"    if "response"    in scores_df.columns else "answer"
+
+    # Solo seleccionamos métricas que realmente existen en el resultado
+    metric_cols = [
+        c for c in ["faithfulness", "answer_relevancy", "context_precision", "context_recall"]
+        if c in scores_df.columns
+    ]
+
+    detalle = scores_df[
+        [col_question, col_answer] + metric_cols
+    ].to_dict(orient="records")
+
+    return {
+        "resumen": {m: round(scores_df[m].mean(), 4) for m in metric_cols},
+        "detalle_por_pregunta": detalle,
+    }
+
 
 
 @app.get("/estado")
